@@ -329,3 +329,146 @@ def slice_expand_and_flatten(token_tensor, B, S):
     # Finally flatten => shape (B*S, ...)
     combined = combined.view(B * S, *combined.shape[2:])
     return combined
+
+
+class NVSAggregator(Aggregator):
+    """
+    Novel View Synthesis Aggregator that processes fused input and target tokens.
+    
+    Following the VGGT paper's NVS approach:
+    "These tokens, representing both the input images and the target views, 
+    are concatenated and processed by the AA transformer."
+    
+    Unlike the base Aggregator which processes only input images through the AA transformer,
+    this NVSAggregator accepts pre-encoded target tokens and concatenates them with 
+    input tokens BEFORE processing through the AA transformer.
+    
+    Args: Same as Aggregator
+    """
+    
+    def forward(
+        self, 
+        input_images: torch.Tensor, 
+        target_tokens: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], List[int]]:
+        """
+        Forward pass with fused input and target tokens.
+        
+        Args:
+            input_images (torch.Tensor): Input images with shape [B, S_in, 3, H, W], in range [0, 1].
+                B: batch size, S_in: number of input views
+            target_tokens (torch.Tensor): Pre-encoded target tokens with shape [B, S_out, N_patches, D].
+                S_out: number of target views, N_patches: patches per view, D: embedding dimension
+        
+        Returns:
+            (list[torch.Tensor], list[int]):
+                - List of outputs from the attention blocks (each: [B, S_total, P, 2C])
+                - List of patch start indices for all frames (length: S_in + S_out + 1)
+        """
+        B, S_in, C_in, H, W = input_images.shape
+        _, S_out, N_target_patches, D = target_tokens.shape
+        
+        if C_in != 3:
+            raise ValueError(f"Expected 3 input channels, got {C_in}")
+        
+        # Step 1: Encode input images to patch tokens (without AA transformer)
+        images = (input_images - self._resnet_mean) / self._resnet_std
+        images = images.view(B * S_in, C_in, H, W)
+        patch_tokens = self.patch_embed(images)
+        
+        if isinstance(patch_tokens, dict):
+            patch_tokens = patch_tokens["x_norm_patchtokens"]
+        
+        _, P_input, C = patch_tokens.shape
+        
+        # Step 2: Add special tokens (camera and register) to input patches
+        camera_token = slice_expand_and_flatten(self.camera_token, B, S_in)
+        register_token = slice_expand_and_flatten(self.register_token, B, S_in)
+        input_tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        
+        # Step 3: Prepare target tokens with special tokens
+        # For target views, we use the "other" camera/register tokens (not the query ones)
+        # Since targets are additional views beyond the first input view
+        camera_token_target = self.camera_token[:, 1:2, ...].expand(B, S_out, *self.camera_token.shape[2:])
+        camera_token_target = camera_token_target.reshape(B * S_out, *camera_token_target.shape[2:])
+        
+        register_token_target = self.register_token[:, 1:2, ...].expand(B, S_out, *self.register_token.shape[2:])
+        register_token_target = register_token_target.reshape(B * S_out, *register_token_target.shape[2:])
+        
+        # Reshape target_tokens from [B, S_out, N_patches, D] to [B*S_out, N_patches, D]
+        target_tokens_flat = target_tokens.reshape(B * S_out, N_target_patches, D)
+        target_tokens_with_special = torch.cat([camera_token_target, register_token_target, target_tokens_flat], dim=1)
+        
+        # Step 4: Concatenate input and target tokens
+        # Shape: [B*(S_in+S_out), P, C] where P includes special tokens and patches
+        S_total = S_in + S_out
+        tokens = torch.cat([input_tokens, target_tokens_with_special], dim=0)
+        tokens = tokens.view(B, S_total, -1, C).view(B * S_total, -1, C)
+        
+        _, P, C = tokens.shape
+        
+        # Step 5: Create position embeddings for all tokens
+        pos = None
+        if self.rope is not None:
+            # Position embeddings for input images
+            pos_input = self.position_getter(B * S_in, H // self.patch_size, W // self.patch_size, device=images.device)
+            
+            # Position embeddings for target tokens (same spatial structure)
+            pos_target = self.position_getter(B * S_out, int(N_target_patches ** 0.5), int(N_target_patches ** 0.5), device=images.device)
+            
+            # Concatenate position embeddings
+            pos = torch.cat([pos_input, pos_target], dim=0)
+            pos = pos.view(B, S_total, -1, 2).view(B * S_total, -1, 2)
+        
+        if self.patch_start_idx > 0 and pos is not None:
+            # Add position offset and prepend zeros for special tokens
+            pos = pos + 1
+            pos_special = torch.zeros(B * S_total, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
+            pos = torch.cat([pos_special, pos], dim=1)
+        
+        # Step 6: Process through AA transformer
+        frame_idx = 0
+        global_idx = 0
+        output_list = []
+        
+        for _ in range(self.aa_block_num):
+            for attn_type in self.aa_order:
+                if attn_type == "frame":
+                    tokens, frame_idx, frame_intermediates = self._process_frame_attention(
+                        tokens, B, S_total, P, C, frame_idx, pos=pos
+                    )
+                elif attn_type == "global":
+                    tokens, global_idx, global_intermediates = self._process_global_attention(
+                        tokens, B, S_total, P, C, global_idx, pos=pos
+                    )
+                else:
+                    raise ValueError(f"Unknown attention type: {attn_type}")
+            
+            for i in range(len(frame_intermediates)):
+                # concat frame and global intermediates, [B x S_total x P x 2C]
+                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                output_list.append(concat_inter)
+        
+        del concat_inter
+        del frame_intermediates
+        del global_intermediates
+        
+        # Step 7: Return outputs with patch indices for all frames
+        # Flatten the output tokens to [B, S_total*P, 2C] for compatibility with heads
+        flattened_output_list = []
+        for output in output_list:
+            # output shape: [B, S_total, P, 2C]
+            B_out, S, P, C = output.shape
+            flattened = output.reshape(B_out, S * P, C)
+            flattened_output_list.append(flattened)
+        
+        # Patch indices mark the start of each frame's patches in the flattened sequence
+        # Each frame has: self.patch_start_idx special tokens, then patches
+        # The special tokens are: 1 camera + num_register_tokens register tokens
+        patches_per_frame = (H // self.patch_size) ** 2
+        total_tokens_per_frame = self.patch_start_idx + patches_per_frame
+        
+        # Create list of where patches start for each frame (skipping special tokens)
+        patch_start_idx_list = [i * total_tokens_per_frame + self.patch_start_idx for i in range(S_total + 1)]
+        
+        return flattened_output_list, patch_start_idx_list
