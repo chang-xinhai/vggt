@@ -9,7 +9,8 @@ import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
 from vggt.models.aggregator import Aggregator
-from vggt.heads.nvs_head import PluckerEncoder, RGBRegressionHead
+from vggt.heads.nvs_head import PluckerEncoder
+from vggt.heads.dpt_head import DPTHead
 from vggt.utils.plucker_rays import generate_plucker_rays, plucker_rays_to_image
 
 
@@ -20,7 +21,7 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
     Following the approach described in the VGGT paper:
     - Takes 4 input images (encoded with DINO)
     - Takes target view Plücker rays (encoded with convolutional layer)
-    - Processes concatenated tokens through AA transformer
+    - Concatenates tokens and processes them together through AA transformer
     - Outputs RGB images for target views using DPT head
     
     Key difference from standard VGGT: Does NOT require camera parameters for input frames.
@@ -38,7 +39,7 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         
-        # Aggregator for processing input images with AA transformer
+        # Aggregator for processing tokens with AA transformer
         self.aggregator = Aggregator(
             img_size=img_size, 
             patch_size=patch_size, 
@@ -54,11 +55,34 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
         )
         
         # RGB regression head using DPT architecture
-        self.rgb_head = RGBRegressionHead(
+        # DPTHead configured for RGB output with feature_only=True
+        # We'll add our own output head for RGB
+        self.rgb_dpt = DPTHead(
             dim_in=2 * embed_dim,  # Aggregator outputs 2x embed_dim
             patch_size=patch_size,
-            img_size=img_size,
+            output_dim=3,  # Not used when feature_only=True
+            features=256,
+            out_channels=[256, 512, 1024, 1024],
+            intermediate_layer_idx=[4, 11, 17, 23],
+            pos_embed=True,
+            feature_only=True,  # Get features, we'll add our own RGB head
         )
+        
+        # Simple output head for RGB
+        self.rgb_output = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 3, kernel_size=1),
+            nn.Sigmoid(),  # RGB values in [0, 1]
+        )
+        
+        # Register normalization constants as buffers (for input images)
+        _RESNET_MEAN = [0.485, 0.456, 0.406]
+        _RESNET_STD = [0.229, 0.224, 0.225]
+        self.register_buffer("_resnet_mean", torch.FloatTensor(_RESNET_MEAN).view(1, 1, 3, 1, 1), persistent=False)
+        self.register_buffer("_resnet_std", torch.FloatTensor(_RESNET_STD).view(1, 1, 3, 1, 1), persistent=False)
     
     def forward(self, input_images, target_intrinsics, target_extrinsics):
         """
@@ -94,50 +118,15 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
         
         plucker_images = torch.stack(plucker_rays_list, dim=0)  # (B, S_out, 6, H, W)
         
-        # Encode input images through aggregator
-        # The aggregator expects input shape [B, S, 3, H, W]
-        input_tokens_list, input_patch_idx = self.aggregator(input_images)
-        
-        # Encode Plücker rays for target views
-        target_tokens = self.plucker_encoder(plucker_images)  # (B, S_out, N_patches, D)
-        
-        # Concatenate input and target tokens
-        # We need to merge them along the sequence dimension for processing
-        # First, reshape input tokens to separate sequences
-        combined_tokens_list = []
-        for layer_tokens in input_tokens_list:
-            # layer_tokens: (B, N_total, D) where N_total includes all input view patches
-            # target_tokens: (B, S_out, N_patches, D)
-            
-            # Flatten target tokens to match aggregator output format
-            B, S_out, N_patches, D = target_tokens.shape
-            target_flat = target_tokens.reshape(B, S_out * N_patches, D)
-            
-            # Concatenate along token dimension
-            combined = torch.cat([layer_tokens, target_flat], dim=1)  # (B, N_total + S_out*N_patches, D)
-            combined_tokens_list.append(combined)
-        
-        # Update patch indices to include target views
-        num_input_patches = input_patch_idx[-1]
-        target_patch_idx = input_patch_idx + [
-            num_input_patches + i * target_tokens.shape[2] 
-            for i in range(1, S_out + 1)
-        ]
-        
-        # Regress RGB colors for target views
-        rgb_output = self.rgb_head(combined_tokens_list, target_patch_idx)
-        
-        # The RGB head should output only for target views
-        # We extract the target view portion (last S_out views)
-        rgb_target = rgb_output[:, -S_out:, :, :, :]
-        
-        return rgb_target
+        # Use the alternative forward that takes pre-computed Plücker images
+        return self.forward_with_separate_encoding(input_images, plucker_images)
     
     def forward_with_separate_encoding(self, input_images, target_plucker_images):
         """
         Alternative forward pass that takes pre-computed Plücker ray images.
         
-        This is useful when Plücker rays are pre-computed during data loading.
+        This is the main forward implementation that properly fuses input and target tokens
+        before processing through the AA transformer.
         
         Args:
             input_images (torch.Tensor): Input images with shape [B, S_in, 3, H, W]
@@ -149,29 +138,83 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
         B, S_in, C, H, W = input_images.shape
         _, S_out, _, _, _ = target_plucker_images.shape
         
-        # Encode input images through aggregator
-        input_tokens_list, input_patch_idx = self.aggregator(input_images)
+        # Normalize input images
+        input_images_norm = (input_images - self._resnet_mean) / self._resnet_std
+        
+        # Encode input images through patch embedding
+        # Reshape to [B*S_in, C, H, W] for patch embedding
+        input_images_flat = input_images_norm.view(B * S_in, C, H, W)
+        input_patch_tokens = self.aggregator.patch_embed(input_images_flat)
+        
+        if isinstance(input_patch_tokens, dict):
+            input_patch_tokens = input_patch_tokens["x_norm_patchtokens"]
+        
+        # input_patch_tokens: (B*S_in, N_patches, D)
         
         # Encode Plücker rays for target views
-        target_tokens = self.plucker_encoder(target_plucker_images)  # (B, S_out, N_patches, D)
+        # Reshape to [B*S_out, 6, H, W]
+        plucker_flat = target_plucker_images.view(B * S_out, 6, H, W)
         
-        # Concatenate input and target tokens
-        combined_tokens_list = []
-        for layer_tokens in input_tokens_list:
-            B, S_out_t, N_patches, D = target_tokens.shape
-            target_flat = target_tokens.reshape(B, S_out_t * N_patches, D)
-            combined = torch.cat([layer_tokens, target_flat], dim=1)
-            combined_tokens_list.append(combined)
+        # Apply convolutional projection
+        target_patch_tokens = self.plucker_encoder.proj(plucker_flat)  # (B*S_out, D, h, w)
         
-        # Update patch indices
-        num_input_patches = input_patch_idx[-1]
-        target_patch_idx = input_patch_idx + [
-            num_input_patches + i * target_tokens.shape[2] 
-            for i in range(1, S_out + 1)
-        ]
+        # Flatten spatial dimensions to get tokens
+        target_patch_tokens = target_patch_tokens.flatten(2)  # (B*S_out, D, N_patches)
+        target_patch_tokens = target_patch_tokens.transpose(1, 2)  # (B*S_out, N_patches, D)
         
-        # Regress RGB colors for target views
-        rgb_output = self.rgb_head(combined_tokens_list, target_patch_idx)
-        rgb_target = rgb_output[:, -S_out:, :, :, :]
+        # Concatenate input and target tokens along the sequence dimension
+        # input_patch_tokens: (B*S_in, N_patches, D)
+        # target_patch_tokens: (B*S_out, N_patches, D)
+        # We need to concatenate them as (B*(S_in+S_out), N_patches, D)
+        
+        # First reshape to separate batch dimension
+        N_patches = input_patch_tokens.shape[1]
+        D = input_patch_tokens.shape[2]
+        
+        input_patch_tokens = input_patch_tokens.view(B, S_in, N_patches, D)
+        target_patch_tokens = target_patch_tokens.view(B, S_out, N_patches, D)
+        
+        # Concatenate along sequence dimension
+        combined_patch_tokens = torch.cat([input_patch_tokens, target_patch_tokens], dim=1)  # (B, S_in+S_out, N_patches, D)
+        
+        # Flatten back to (B*(S_in+S_out), N_patches, D)
+        S_total = S_in + S_out
+        combined_patch_tokens = combined_patch_tokens.view(B * S_total, N_patches, D)
+        
+        # Process through AA transformer using the new method
+        aggregated_tokens_list, patch_start_idx = self.aggregator.forward_with_tokens_and_sequence(
+            patch_tokens=combined_patch_tokens,
+            B=B,
+            S=S_total,
+            img_size=H,
+        )
+        
+        # Create a "dummy" images tensor for DPT head (just for shape/device information)
+        # The DPT head needs the original image tensor for some operations
+        dummy_images = torch.cat([input_images, torch.zeros(B, S_out, 3, H, W, device=input_images.device)], dim=1)
+        
+        # Get DPT features
+        dpt_features = self.rgb_dpt(
+            aggregated_tokens_list=aggregated_tokens_list,
+            images=dummy_images,
+            patch_start_idx=patch_start_idx,
+        )
+        
+        # dpt_features shape: (B, S_total, C, H, W) where C=256 (features)
+        # Reshape to process all views at once
+        B, S_total, C_feat, H_feat, W_feat = dpt_features.shape
+        dpt_features_flat = dpt_features.view(B * S_total, C_feat, H_feat, W_feat)
+        
+        # Apply RGB output head
+        rgb_output_flat = self.rgb_output(dpt_features_flat)  # (B*S_total, 3, H_feat, W_feat)
+        
+        # Reshape back
+        rgb_output = rgb_output_flat.view(B, S_total, 3, H_feat, W_feat)
+        
+        # Extract only the target views (last S_out views)
+        rgb_target = rgb_output[:, S_in:, :, :, :]  # (B, S_out, 3, H, W)
+        
+        # Convert to (B, S_out, H, W, 3) format
+        rgb_target = rgb_target.permute(0, 1, 3, 4, 2)
         
         return rgb_target

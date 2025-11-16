@@ -19,7 +19,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vggt.utils.plucker_rays import generate_plucker_rays, plucker_rays_to_image
-from vggt.heads.nvs_head import PluckerEncoder, RGBRegressionHead
+from vggt.heads.nvs_head import PluckerEncoder
+from vggt.heads.dpt_head import DPTHead
 from vggt.models.vggt_nvs import VGGT_NVS
 
 
@@ -85,39 +86,48 @@ def test_plucker_encoder():
     return True
 
 
-def test_rgb_head():
-    """Test RGB regression head."""
-    print("Testing RGB regression head...")
+def test_dpt_head():
+    """Test DPT head for RGB output."""
+    print("Testing DPT head for RGB...")
     
     B, S, H, W = 2, 2, 518, 518
     embed_dim = 2048
     patch_size = 14
     num_patches_per_frame = (H // patch_size) ** 2
     
-    head = RGBRegressionHead(dim_in=embed_dim, patch_size=patch_size, img_size=H)
+    # Create DPT head with feature_only=True (as used in VGGT_NVS)
+    dpt_head = DPTHead(
+        dim_in=embed_dim, 
+        patch_size=patch_size,
+        features=256,
+        feature_only=True,
+    )
+    
+    # Patch start index (where patch tokens begin after special tokens)
+    patch_start_idx = 5  # Typical value with camera and register tokens
     
     # Create dummy aggregated tokens (simulating AA transformer output)
     # Simulate 24 layers with tokens for S frames
+    # Each token tensor should have shape [B, S, total_tokens, D]
+    # where total_tokens = patch_start_idx + num_patches_per_frame
+    total_tokens = patch_start_idx + num_patches_per_frame
     aggregated_tokens_list = []
     for _ in range(24):
-        tokens = torch.randn(B, S * num_patches_per_frame, embed_dim)
+        # Each layer has tokens for all frames: [B, S, total_tokens, D]
+        tokens = torch.randn(B, S, total_tokens, embed_dim)
         aggregated_tokens_list.append(tokens)
     
-    # Patch start indices
-    patch_start_idx = [i * num_patches_per_frame for i in range(S + 1)]
+    # Create dummy images
+    dummy_images = torch.randn(B, S, 3, H, W)
     
-    # Generate RGB output
-    rgb_output = head(aggregated_tokens_list, patch_start_idx)
+    # Generate features
+    features = dpt_head(aggregated_tokens_list, dummy_images, patch_start_idx)
     
-    # Check shape
-    assert rgb_output.shape == (B, S, H, W, 3), \
-        f"Expected shape ({B}, {S}, {H}, {W}, 3), got {rgb_output.shape}"
+    # Check shape (should return features when feature_only=True)
+    assert features.shape == (B, S, 256, H, W), \
+        f"Expected shape ({B}, {S}, 256, {H}, {W}), got {features.shape}"
     
-    # Check value range (should be in [0, 1] due to sigmoid)
-    assert rgb_output.min() >= 0 and rgb_output.max() <= 1, \
-        f"RGB values should be in [0, 1], got min={rgb_output.min()}, max={rgb_output.max()}"
-    
-    print("✓ RGB regression head test passed")
+    print("✓ DPT head test passed")
     return True
 
 
@@ -181,7 +191,7 @@ def main():
     results.append(("Plücker Encoder", test_plucker_encoder()))
     print()
     
-    results.append(("RGB Head", test_rgb_head()))
+    results.append(("DPT Head", test_dpt_head()))
     print()
     
     results.append(("VGGT-NVS Model", test_vggt_nvs_model()))

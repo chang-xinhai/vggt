@@ -257,6 +257,125 @@ class Aggregator(nn.Module):
         del global_intermediates
         return output_list, self.patch_start_idx
 
+    def forward_with_patch_tokens(
+        self, 
+        patch_tokens: torch.Tensor, 
+        img_size: int,
+        device: torch.device = None
+    ) -> Tuple[List[torch.Tensor], int]:
+        """
+        Forward pass using pre-encoded patch tokens instead of images.
+        This allows processing heterogeneous token sequences (e.g., input images + target views).
+        
+        Args:
+            patch_tokens (torch.Tensor): Pre-encoded patch tokens with shape [B*S, P, C]
+                where B is batch size, S is sequence length, P is number of patches per frame,
+                and C is embedding dimension
+            img_size (int): Image size used for positional embeddings
+            device (torch.device, optional): Device to use. If None, inferred from patch_tokens.
+        
+        Returns:
+            (list[torch.Tensor], int):
+                The list of outputs from the attention blocks,
+                and the patch_start_idx indicating where patch tokens begin.
+        """
+        BS, P, C = patch_tokens.shape
+        
+        if device is None:
+            device = patch_tokens.device
+        
+        # Infer B and S from the token structure
+        # Since we don't know S directly, we need it to be passed or inferred
+        # For now, we'll handle it by assuming S is embedded in the token structure
+        # and can be determined from special token expansion
+        
+        # We need to determine B and S. This is tricky without additional context.
+        # For the NVS use case, we'll need to pass these as parameters.
+        # Let's modify the signature to include B and S
+        raise NotImplementedError(
+            "This method needs B and S to properly handle camera and register tokens. "
+            "Use forward_with_tokens_and_sequence instead."
+        )
+    
+    def forward_with_tokens_and_sequence(
+        self,
+        patch_tokens: torch.Tensor,
+        B: int,
+        S: int,
+        img_size: int,
+    ) -> Tuple[List[torch.Tensor], int]:
+        """
+        Forward pass using pre-encoded patch tokens with explicit batch and sequence dimensions.
+        This allows processing heterogeneous token sequences (e.g., input images + target views).
+        
+        Args:
+            patch_tokens (torch.Tensor): Pre-encoded patch tokens with shape [B*S, P, C]
+                where B is batch size, S is sequence length (including both input and target views),
+                P is number of patches per frame, and C is embedding dimension
+            B (int): Batch size
+            S (int): Sequence length (number of views, including input and target)
+            img_size (int): Image size used for positional embeddings
+        
+        Returns:
+            (list[torch.Tensor], int):
+                The list of outputs from the attention blocks,
+                and the patch_start_idx indicating where patch tokens begin.
+        """
+        BS, P, C = patch_tokens.shape
+        
+        if BS != B * S:
+            raise ValueError(f"patch_tokens shape {patch_tokens.shape} doesn't match B={B}, S={S}")
+        
+        device = patch_tokens.device
+        
+        # Expand camera and register tokens to match batch size and sequence length
+        camera_token = slice_expand_and_flatten(self.camera_token, B, S)
+        register_token = slice_expand_and_flatten(self.register_token, B, S)
+        
+        # Concatenate special tokens with patch tokens
+        tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        
+        pos = None
+        if self.rope is not None:
+            pos = self.position_getter(B * S, img_size // self.patch_size, img_size // self.patch_size, device=device)
+        
+        if self.patch_start_idx > 0:
+            # do not use position embedding for special tokens (camera and register tokens)
+            # so set pos to 0 for the special tokens
+            pos = pos + 1
+            pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(device).to(pos.dtype)
+            pos = torch.cat([pos_special, pos], dim=1)
+        
+        # update P because we added special tokens
+        _, P, C = tokens.shape
+        
+        frame_idx = 0
+        global_idx = 0
+        output_list = []
+        
+        for _ in range(self.aa_block_num):
+            for attn_type in self.aa_order:
+                if attn_type == "frame":
+                    tokens, frame_idx, frame_intermediates = self._process_frame_attention(
+                        tokens, B, S, P, C, frame_idx, pos=pos
+                    )
+                elif attn_type == "global":
+                    tokens, global_idx, global_intermediates = self._process_global_attention(
+                        tokens, B, S, P, C, global_idx, pos=pos
+                    )
+                else:
+                    raise ValueError(f"Unknown attention type: {attn_type}")
+            
+            for i in range(len(frame_intermediates)):
+                # concat frame and global intermediates, [B x S x P x 2C]
+                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                output_list.append(concat_inter)
+        
+        del concat_inter
+        del frame_intermediates
+        del global_intermediates
+        return output_list, self.patch_start_idx
+
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
