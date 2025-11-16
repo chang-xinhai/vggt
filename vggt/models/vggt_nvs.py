@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
-from vggt.models.aggregator import Aggregator
+from vggt.models.aggregator import Aggregator, NVSAggregator
 from vggt.heads.nvs_head import PluckerEncoder, RGBRegressionHead
 from vggt.utils.plucker_rays import generate_plucker_rays, plucker_rays_to_image
 
@@ -38,8 +38,8 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         
-        # Aggregator for processing input images with AA transformer
-        self.aggregator = Aggregator(
+        # NVS-specific aggregator that processes fused input and target tokens
+        self.aggregator = NVSAggregator(
             img_size=img_size, 
             patch_size=patch_size, 
             embed_dim=embed_dim
@@ -94,41 +94,17 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
         
         plucker_images = torch.stack(plucker_rays_list, dim=0)  # (B, S_out, 6, H, W)
         
-        # Encode input images through aggregator
-        # The aggregator expects input shape [B, S, 3, H, W]
-        input_tokens_list, input_patch_idx = self.aggregator(input_images)
-        
         # Encode Plücker rays for target views
         target_tokens = self.plucker_encoder(plucker_images)  # (B, S_out, N_patches, D)
         
-        # Concatenate input and target tokens
-        # We need to merge them along the sequence dimension for processing
-        # First, reshape input tokens to separate sequences
-        combined_tokens_list = []
-        for layer_tokens in input_tokens_list:
-            # layer_tokens: (B, N_total, D) where N_total includes all input view patches
-            # target_tokens: (B, S_out, N_patches, D)
-            
-            # Flatten target tokens to match aggregator output format
-            B, S_out, N_patches, D = target_tokens.shape
-            target_flat = target_tokens.reshape(B, S_out * N_patches, D)
-            
-            # Concatenate along token dimension
-            combined = torch.cat([layer_tokens, target_flat], dim=1)  # (B, N_total + S_out*N_patches, D)
-            combined_tokens_list.append(combined)
-        
-        # Update patch indices to include target views
-        num_input_patches = input_patch_idx[-1]
-        target_patch_idx = input_patch_idx + [
-            num_input_patches + i * target_tokens.shape[2] 
-            for i in range(1, S_out + 1)
-        ]
+        # Process input images and target tokens together through AA transformer
+        # The NVSAggregator concatenates them before AA transformer processing
+        combined_tokens_list, patch_start_idx = self.aggregator(input_images, target_tokens)
         
         # Regress RGB colors for target views
-        rgb_output = self.rgb_head(combined_tokens_list, target_patch_idx)
+        rgb_output = self.rgb_head(combined_tokens_list, patch_start_idx)
         
-        # The RGB head should output only for target views
-        # We extract the target view portion (last S_out views)
+        # Extract target view portion (last S_out views)
         rgb_target = rgb_output[:, -S_out:, :, :, :]
         
         return rgb_target
@@ -149,29 +125,17 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
         B, S_in, C, H, W = input_images.shape
         _, S_out, _, _, _ = target_plucker_images.shape
         
-        # Encode input images through aggregator
-        input_tokens_list, input_patch_idx = self.aggregator(input_images)
-        
         # Encode Plücker rays for target views
         target_tokens = self.plucker_encoder(target_plucker_images)  # (B, S_out, N_patches, D)
         
-        # Concatenate input and target tokens
-        combined_tokens_list = []
-        for layer_tokens in input_tokens_list:
-            B, S_out_t, N_patches, D = target_tokens.shape
-            target_flat = target_tokens.reshape(B, S_out_t * N_patches, D)
-            combined = torch.cat([layer_tokens, target_flat], dim=1)
-            combined_tokens_list.append(combined)
-        
-        # Update patch indices
-        num_input_patches = input_patch_idx[-1]
-        target_patch_idx = input_patch_idx + [
-            num_input_patches + i * target_tokens.shape[2] 
-            for i in range(1, S_out + 1)
-        ]
+        # Process input images and target tokens together through AA transformer
+        # The NVSAggregator concatenates them before AA transformer processing
+        combined_tokens_list, patch_start_idx = self.aggregator(input_images, target_tokens)
         
         # Regress RGB colors for target views
-        rgb_output = self.rgb_head(combined_tokens_list, target_patch_idx)
+        rgb_output = self.rgb_head(combined_tokens_list, patch_start_idx)
+        
+        # Extract target view portion (last S_out views)
         rgb_target = rgb_output[:, -S_out:, :, :, :]
         
         return rgb_target
