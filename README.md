@@ -219,6 +219,43 @@ python examples/simple_trainer.py  default --data_factor 1 --data_dir /YOUR/SCEN
 ```
 
 
+## Novel View Synthesis (NVS) Evaluation on GSO
+
+For evaluating the VGGT-NVS model on the Google Scanned Objects (GSO) dataset, we provide scripts to render the dataset following the Instant3D/GS-LRM/LVSM protocol:
+
+### Quick Start
+
+```bash
+# 1. Setup workspace and prerequisites
+python scripts/gso/prepare_gso.py --output_dir /path/to/gso_workspace
+
+# 2. Download and convert GSO dataset (follow instructions from prepare_gso.py)
+# See docs/GSO_Dataset_Preparation.md for detailed guide
+
+# 3. Render dataset (64 views per object: 4 elevations × 16 azimuths)
+python scripts/gso/batch_render_gso.py \
+    --glb_folder /path/to/GSO_GLB \
+    --out_path /path/to/GSO_rendered \
+    --num_workers 4
+
+# 4. Evaluate VGGT-NVS model
+python eval_nvs_gso.py \
+    --gso_dir /path/to/GSO_rendered \
+    --checkpoint /path/to/checkpoint.pt \
+    --num_input_views 4 \
+    --num_target_views 10
+```
+
+**Documentation**:
+- [GSO Dataset Preparation Guide](docs/GSO_Dataset_Preparation.md) - Comprehensive preparation instructions
+- [GSO Scripts README](scripts/gso/README.md) - Quick reference for rendering scripts
+- [GSO Data Format](scripts/gso/DATA_FORMAT.md) - Data structure specification
+
+**Evaluation Protocol** (following Instant3D/LVSM):
+- 4 structured input views: elevation 20°, azimuths [45°, 135°, 225°, 315°]
+- 10 random target views from remaining 60 views
+- Metrics: PSNR, SSIM, LPIPS
+
 
 ## Zero-shot Single-view Reconstruction
 
