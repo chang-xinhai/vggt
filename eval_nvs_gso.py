@@ -8,7 +8,10 @@
 Evaluation script for Feed-forward Novel View Synthesis on GSO dataset.
 
 This script evaluates the VGGT-NVS model on the Google Scanned Objects (GSO) dataset,
-following the evaluation protocol from LVSM.
+following the evaluation protocol from Instant3D and LVSM:
+- 4 structured input views: elevation 20°, azimuths [45°, 135°, 225°, 315°]
+- 10 random target views from remaining 60 views
+- Metrics: PSNR, SSIM, LPIPS (averaged over all objects)
 """
 
 import os
@@ -116,15 +119,18 @@ def compute_ssim(pred, target):
     return ssim
 
 
-def evaluate_model(model, gso_dir, num_input_views=4, num_target_views=1, device='cuda'):
+def evaluate_model(model, gso_dir, num_input_views=4, num_target_views=10, device='cuda'):
     """
-    Evaluate the model on GSO dataset.
+    Evaluate the model on GSO dataset following the Instant3D/LVSM protocol.
+    
+    Following Instant3D: "We use 4 views with elevation 20° and azimuths 45°, 135°, 225°, 315° as input,
+    and randomly sample 10 views from the remaining views as our testing set."
     
     Args:
         model: VGGT_NVS model
         gso_dir (str): Path to GSO dataset
-        num_input_views (int): Number of input views
-        num_target_views (int): Number of target views to synthesize
+        num_input_views (int): Number of input views (default: 4, following LVSM)
+        num_target_views (int): Number of target views to synthesize (default: 10, following LVSM)
         device (str): Device to run evaluation on
     
     Returns:
@@ -159,16 +165,41 @@ def evaluate_model(model, gso_dir, num_input_views=4, num_target_views=1, device
                 if len(available_views) < num_input_views + num_target_views:
                     continue
                 
-                # Sample views (deterministic for evaluation)
-                np.random.seed(42)
-                sampled_views = np.random.choice(
-                    available_views, 
-                    size=num_input_views + num_target_views,
-                    replace=False
-                )
+                # Following Instant3D protocol: 4 structured input views
+                # Elevation 20°, Azimuths [45°, 135°, 225°, 315°]
+                # Assuming 16 azimuths per elevation (0°, 22.5°, 45°, ..., 337.5°)
+                # and views are ordered as: elevation_idx * 16 + azimuth_idx
                 
-                input_view_ids = sampled_views[:num_input_views]
-                target_view_ids = sampled_views[num_input_views:]
+                # For elevation 20° (index 1), azimuths [45°, 135°, 225°, 315°]
+                # correspond to azimuth indices [2, 6, 10, 14]
+                input_view_indices = [
+                    1 * 16 + 2,   # view 18: elevation 20°, azimuth 45°
+                    1 * 16 + 6,   # view 22: elevation 20°, azimuth 135°
+                    1 * 16 + 10,  # view 26: elevation 20°, azimuth 225°
+                    1 * 16 + 14,  # view 30: elevation 20°, azimuth 315°
+                ]
+                
+                # Convert to view IDs (zero-padded 3-digit strings)
+                input_view_ids = [f"{idx:03d}" for idx in input_view_indices]
+                
+                # Verify all input views exist
+                if not all(vid in available_views for vid in input_view_ids):
+                    logger.warning(f"Skipping {obj_name}: missing required input views")
+                    continue
+                
+                # Sample target views from remaining views (deterministic for evaluation)
+                remaining_views = [v for v in available_views if v not in input_view_ids]
+                
+                if len(remaining_views) < num_target_views:
+                    logger.warning(f"Skipping {obj_name}: insufficient target views")
+                    continue
+                
+                np.random.seed(42)  # For reproducibility
+                target_view_ids = list(np.random.choice(
+                    remaining_views,
+                    size=num_target_views,
+                    replace=False
+                ))
                 
                 # Load data
                 input_images, _, _ = load_gso_data(gso_dir, obj_name, input_view_ids)
@@ -223,7 +254,7 @@ def main():
     parser.add_argument('--gso_dir', type=str, required=True, help='Path to GSO dataset')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
     parser.add_argument('--num_input_views', type=int, default=4, help='Number of input views')
-    parser.add_argument('--num_target_views', type=int, default=1, help='Number of target views')
+    parser.add_argument('--num_target_views', type=int, default=10, help='Number of target views')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
     parser.add_argument('--output', type=str, default='gso_results.json', help='Output file for results')
     
