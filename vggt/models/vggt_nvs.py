@@ -101,11 +101,33 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
         # The NVSAggregator concatenates them before AA transformer processing
         combined_tokens_list, patch_start_idx = self.aggregator(input_images, target_tokens)
         
-        # Regress RGB colors for target views
-        rgb_output = self.rgb_head(combined_tokens_list, patch_start_idx)
+        # Extract only target frame PATCH tokens for RGB head (no special tokens)
+        # Source and target tokens embed different information:
+        # - Source tokens: from real images (visual content)
+        # - Target tokens: from Plücker rays (viewpoint info)
+        # RGB head should focus on decoding target tokens only
         
-        # Extract target view portion (last S_out views)
-        rgb_target = rgb_output[:, -S_out:, :, :, :]
+        # Calculate patches per frame from image dimensions
+        patches_per_frame = (H // self.patch_size) ** 2
+        
+        # Extract patches for each target frame
+        target_tokens_list = []
+        for tokens in combined_tokens_list:
+            # Extract patch tokens for all target frames
+            frame_patches = []
+            for frame_idx in range(S_in, S_in + S_out):
+                start = patch_start_idx[frame_idx]
+                # End is start + patches_per_frame (NOT patch_start_idx[frame_idx + 1])
+                end = start + patches_per_frame
+                frame_patches.append(tokens[:, start:end, :])
+            # Concatenate all target frame patches: [B, S_out*patches, 2C]
+            target_tokens_list.append(torch.cat(frame_patches, dim=1))
+        
+        # Create patch indices relative to 0 for target frames only
+        target_patch_start_idx = [i * patches_per_frame for i in range(S_out + 1)]
+        
+        # Regress RGB colors for target views only
+        rgb_target = self.rgb_head(target_tokens_list, target_patch_start_idx)
         
         return rgb_target
     
@@ -132,10 +154,32 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
         # The NVSAggregator concatenates them before AA transformer processing
         combined_tokens_list, patch_start_idx = self.aggregator(input_images, target_tokens)
         
-        # Regress RGB colors for target views
-        rgb_output = self.rgb_head(combined_tokens_list, patch_start_idx)
+        # Extract only target frame PATCH tokens for RGB head (no special tokens)
+        # Source and target tokens embed different information:
+        # - Source tokens: from real images (visual content)
+        # - Target tokens: from Plücker rays (viewpoint info)
+        # RGB head should focus on decoding target tokens only
         
-        # Extract target view portion (last S_out views)
-        rgb_target = rgb_output[:, -S_out:, :, :, :]
+        # Calculate patches per frame from image dimensions
+        patches_per_frame = (H // self.patch_size) ** 2
+        
+        # Extract patches for each target frame
+        target_tokens_list = []
+        for tokens in combined_tokens_list:
+            # Extract patch tokens for all target frames
+            frame_patches = []
+            for frame_idx in range(S_in, S_in + S_out):
+                start = patch_start_idx[frame_idx]
+                # End is start + patches_per_frame (NOT patch_start_idx[frame_idx + 1])
+                end = start + patches_per_frame
+                frame_patches.append(tokens[:, start:end, :])
+            # Concatenate all target frame patches: [B, S_out*patches, 2C]
+            target_tokens_list.append(torch.cat(frame_patches, dim=1))
+        
+        # Create patch indices relative to 0 for target frames only
+        target_patch_start_idx = [i * patches_per_frame for i in range(S_out + 1)]
+        
+        # Regress RGB colors for target views only
+        rgb_target = self.rgb_head(target_tokens_list, target_patch_start_idx)
         
         return rgb_target

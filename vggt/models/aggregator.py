@@ -389,10 +389,11 @@ class NVSAggregator(Aggregator):
         # Step 3: Prepare target tokens with special tokens
         # For target views, we use the "other" camera/register tokens (not the query ones)
         # Since targets are additional views beyond the first input view
-        camera_token_target = self.camera_token[:, 1:2, ...].expand(B, S_out, *self.camera_token.shape[2:])
+        # Using [:, 1:, ...] for consistency with slice_expand_and_flatten pattern
+        camera_token_target = self.camera_token[:, 1:, ...].expand(B, S_out, *self.camera_token.shape[2:])
         camera_token_target = camera_token_target.reshape(B * S_out, *camera_token_target.shape[2:])
         
-        register_token_target = self.register_token[:, 1:2, ...].expand(B, S_out, *self.register_token.shape[2:])
+        register_token_target = self.register_token[:, 1:, ...].expand(B, S_out, *self.register_token.shape[2:])
         register_token_target = register_token_target.reshape(B * S_out, *register_token_target.shape[2:])
         
         # Reshape target_tokens from [B, S_out, N_patches, D] to [B*S_out, N_patches, D]
