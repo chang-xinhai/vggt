@@ -44,9 +44,12 @@ def test_register_token_slicing():
         patch_embed="conv",
     )
     
-    # Check that register_token has shape (1, 2, num_register_tokens, embed_dim)
-    assert aggregator.register_token.shape[1] == 2, \
-        f"register_token should have 2 positions, got {aggregator.register_token.shape[1]}"
+    # Constants for token structure
+    NUM_TOKEN_POSITIONS = 2  # 0: first frame, 1: remaining frames
+    
+    # Check that register_token has expected shape
+    assert aggregator.register_token.shape[1] == NUM_TOKEN_POSITIONS, \
+        f"register_token should have {NUM_TOKEN_POSITIONS} positions, got {aggregator.register_token.shape[1]}"
     
     # Create inputs
     input_images = torch.randn(B, S_in, 3, H, W)
