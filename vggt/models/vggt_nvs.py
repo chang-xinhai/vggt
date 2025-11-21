@@ -60,6 +60,52 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
             img_size=img_size,
         )
     
+    def _extract_target_tokens(self, combined_tokens_list, patch_start_idx, S_in, S_out, H):
+        """
+        Extract only target frame patch tokens for RGB head processing.
+        
+        This method extracts patch tokens (excluding special tokens) for target frames only.
+        Source and target tokens embed different information:
+        - Source tokens: from real images (visual content)
+        - Target tokens: from Plücker rays (viewpoint info)
+        RGB head should focus on decoding target tokens only.
+        
+        Args:
+            combined_tokens_list (list): List of token tensors from AA transformer
+            patch_start_idx (list): Starting indices for patches of each frame
+            S_in (int): Number of input frames
+            S_out (int): Number of target frames
+            H (int): Image height
+        
+        Returns:
+            tuple: (target_tokens_list, target_patch_start_idx)
+        """
+        # Calculate patches per frame from image dimensions
+        patches_per_frame = (H // self.patch_size) ** 2
+        
+        # Extract patches for each target frame
+        target_tokens_list = []
+        for tokens in combined_tokens_list:
+            # Extract patch tokens for all target frames
+            frame_patches = []
+            for frame_idx in range(S_in, S_in + S_out):
+                start = patch_start_idx[frame_idx]
+                # End is start + patches_per_frame (NOT patch_start_idx[frame_idx + 1])
+                # Why: patch_start_idx[frame_idx + 1] would cross frame boundary and include
+                # special tokens from the next frame. We want ONLY patches from this frame.
+                # Example: Frame i has tokens [i*P : (i+1)*P], with special tokens at
+                # [i*P : i*P+5] and patches at [i*P+5 : (i+1)*P]. Using patch_start_idx[i+1]
+                # gives [i*P+5 : (i+1)*P+5] which incorrectly includes next frame's special tokens.
+                end = start + patches_per_frame
+                frame_patches.append(tokens[:, start:end, :])
+            # Concatenate all target frame patches: [B, S_out*patches, 2C]
+            target_tokens_list.append(torch.cat(frame_patches, dim=1))
+        
+        # Create patch indices relative to 0 for target frames only
+        target_patch_start_idx = [i * patches_per_frame for i in range(S_out + 1)]
+        
+        return target_tokens_list, target_patch_start_idx
+    
     def forward(self, input_images, target_intrinsics, target_extrinsics):
         """
         Forward pass for novel view synthesis.
@@ -101,11 +147,13 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
         # The NVSAggregator concatenates them before AA transformer processing
         combined_tokens_list, patch_start_idx = self.aggregator(input_images, target_tokens)
         
-        # Regress RGB colors for target views
-        rgb_output = self.rgb_head(combined_tokens_list, patch_start_idx)
+        # Extract only target frame patch tokens for RGB head
+        target_tokens_list, target_patch_start_idx = self._extract_target_tokens(
+            combined_tokens_list, patch_start_idx, S_in, S_out, H
+        )
         
-        # Extract target view portion (last S_out views)
-        rgb_target = rgb_output[:, -S_out:, :, :, :]
+        # Regress RGB colors for target views only
+        rgb_target = self.rgb_head(target_tokens_list, target_patch_start_idx)
         
         return rgb_target
     
@@ -132,10 +180,12 @@ class VGGT_NVS(nn.Module, PyTorchModelHubMixin):
         # The NVSAggregator concatenates them before AA transformer processing
         combined_tokens_list, patch_start_idx = self.aggregator(input_images, target_tokens)
         
-        # Regress RGB colors for target views
-        rgb_output = self.rgb_head(combined_tokens_list, patch_start_idx)
+        # Extract only target frame patch tokens for RGB head
+        target_tokens_list, target_patch_start_idx = self._extract_target_tokens(
+            combined_tokens_list, patch_start_idx, S_in, S_out, H
+        )
         
-        # Extract target view portion (last S_out views)
-        rgb_target = rgb_output[:, -S_out:, :, :, :]
+        # Regress RGB colors for target views only
+        rgb_target = self.rgb_head(target_tokens_list, target_patch_start_idx)
         
         return rgb_target
