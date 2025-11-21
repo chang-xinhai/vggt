@@ -329,3 +329,135 @@ def slice_expand_and_flatten(token_tensor, B, S):
     # Finally flatten => shape (B*S, ...)
     combined = combined.view(B * S, *combined.shape[2:])
     return combined
+
+def slice_expand_and_flatten_other(token_tensor, B, S):
+    """
+    Processes specialized tokens with shape (1, 2, X, C) for multi-frame processing:
+    1) Uses the first position (index=0) for the first frame only
+    2) Uses the second position (index=1) for all remaining frames (S-1 frames)
+    3) Expands both to match batch size B
+    4) Concatenates to form (B, S, X, C) where each sequence has 1 first-position token
+       followed by (S-1) second-position tokens
+    5) Flattens to (B*S, X, C) for processing
+
+    Returns:
+        torch.Tensor: Processed tokens with shape (B*S, X, C)
+    """
+
+    # Slice out the "other" tokens => shape (1, S, ...)
+    others = token_tensor[:, 1:, ...].expand(B, S, *token_tensor.shape[2:])
+    # Concatenate => shape (B, S, ...)
+    combined = others
+
+    # Finally flatten => shape (B*S, ...)
+    combined = combined.view(B * S, *combined.shape[2:])
+    return combined
+
+
+class NVSAggregator(Aggregator):
+    """
+    Novel View Synthesis Aggregator that processes fused input and target tokens.
+    
+    Following the VGGT paper's NVS approach:
+    "These tokens, representing both the input images and the target views, 
+    are concatenated and processed by the AA transformer."
+    
+    Unlike the base Aggregator which processes only input images through the AA transformer,
+    this NVSAggregator accepts pre-encoded target tokens and concatenates them with 
+    input tokens BEFORE processing through the AA transformer.
+    
+    Args: Same as Aggregator
+    """
+    
+    def forward(self, images: torch.Tensor, target_tokens: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+        """
+        Args:
+            images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
+                B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            target_tokens (torch.Tensor): Pre-encoded target tokens with shape [B, T, P_t, C],
+                where T is the number of target views, P_t is the number of target patches,
+                and C is the embedding dimension.
+
+        Returns:
+            (list[torch.Tensor], int):
+                The list of outputs from the attention blocks,
+                and the patch_start_idx indicating where patch tokens begin.
+        """
+        B, S_in, C_in, H, W = images.shape
+
+        if C_in != 3:
+            raise ValueError(f"Expected 3 input channels, got {C_in}")
+
+        # Normalize images and reshape for patch embed
+        images = (images - self._resnet_mean) / self._resnet_std
+
+        # Reshape to [B*S, C, H, W] for patch embedding
+        images = images.view(B * S_in, C_in, H, W)
+        patch_tokens = self.patch_embed(images)
+
+        if isinstance(patch_tokens, dict):
+            patch_tokens = patch_tokens["x_norm_patchtokens"]
+
+        _, P, C = patch_tokens.shape
+        _, S_out, P_out, C_out = target_tokens.shape
+        
+        if P != P_out or C != C_out:
+            raise ValueError(f"Input patch tokens shape ({P}, {C}) does not match target tokens shape ({P_out}, {C_out})")
+
+        # Expand camera and register tokens to match batch size and sequence length
+        camera_token = slice_expand_and_flatten(self.camera_token, B, S_in)
+        register_token = slice_expand_and_flatten(self.register_token, B, S_in)
+
+        # Concatenate special tokens with patch tokens
+        input_tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        
+        camera_token_target = slice_expand_and_flatten_other(self.camera_token, B, S_out)
+        register_token_target = slice_expand_and_flatten_other(self.register_token, B, S_out)
+        target_tokens = target_tokens.view(B * S_out, P_out, C_out)
+        target_tokens = torch.cat([camera_token_target, register_token_target, target_tokens], dim=1)
+        
+        # Concatenate input and target tokens along the sequence dimension
+        tokens = torch.cat([input_tokens, target_tokens], dim=0)  # Shape
+        S_total = S_in + S_out
+        # tokens = tokens.view(B * S_total, -1, C)
+
+        pos = None
+        if self.rope is not None:
+            pos = self.position_getter(B * S_total, H // self.patch_size, W // self.patch_size, device=images.device)
+
+        if self.patch_start_idx > 0:
+            # do not use position embedding for special tokens (camera and register tokens)
+            # so set pos to 0 for the special tokens
+            pos = pos + 1
+            pos_special = torch.zeros(B * S_total, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
+            pos = torch.cat([pos_special, pos], dim=1)
+
+        # update P because we added special tokens
+        _, P, C = tokens.shape
+
+        frame_idx = 0
+        global_idx = 0
+        output_list = []
+
+        for _ in range(self.aa_block_num):
+            for attn_type in self.aa_order:
+                if attn_type == "frame":
+                    tokens, frame_idx, frame_intermediates = self._process_frame_attention(
+                        tokens, B, S_total, P, C, frame_idx, pos=pos
+                    )
+                elif attn_type == "global":
+                    tokens, global_idx, global_intermediates = self._process_global_attention(
+                        tokens, B, S_total, P, C, global_idx, pos=pos
+                    )
+                else:
+                    raise ValueError(f"Unknown attention type: {attn_type}")
+
+            for i in range(len(frame_intermediates)):
+                # concat frame and global intermediates, [B x S_total x P x 2C]
+                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                output_list.append(concat_inter)
+
+        del concat_inter
+        del frame_intermediates
+        del global_intermediates
+        return output_list, self.patch_start_idx
